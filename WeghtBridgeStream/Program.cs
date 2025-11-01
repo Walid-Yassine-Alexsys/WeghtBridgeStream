@@ -1,0 +1,483 @@
+﻿using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Azure.SignalR.Management;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using System.Globalization;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+
+// =======================
+// Device ID Manager
+// =======================
+
+public static class DeviceIdManager
+{
+    private static readonly string DeviceIdFile;
+    private static string? _cachedDeviceId;
+
+    static DeviceIdManager()
+    {
+        var baseDirectory = AppContext.BaseDirectory;
+        DeviceIdFile = Path.Combine(baseDirectory, "device.id.txt");
+    }
+
+    public static string GetOrCreateDeviceId()
+    {
+        if (_cachedDeviceId != null)
+            return _cachedDeviceId;
+
+        if (File.Exists(DeviceIdFile))
+        {
+            var existing = File.ReadAllText(DeviceIdFile).Trim();
+            if (!string.IsNullOrWhiteSpace(existing))
+            {
+                _cachedDeviceId = existing;
+                return existing;
+            }
+        }
+
+        var newId = Guid.NewGuid().ToString();
+        File.WriteAllText(DeviceIdFile, newId);
+        _cachedDeviceId = newId;
+        return newId;
+    }
+
+    public static string GetDeviceIdFilePath() => DeviceIdFile;
+}
+
+// =======================
+// Options
+// =======================
+
+public sealed class AppOptions
+{
+    public string? ForceDeviceId { get; set; }
+    public int HttpPort { get; set; } = 5001;
+}
+
+public sealed class SignalROptions
+{
+    public string ConnectionString { get; set; } = default!;
+    public string HubName { get; set; } = "entry_weight_hub";
+    public string MethodName { get; set; } = "ReceivefirstWeight";
+}
+
+public sealed class ScaleOptions
+{
+    public string Host { get; set; } = "10.116.136.29";
+    public int Port { get; set; } = 4001;
+    public int ReadTimeoutMs { get; set; } = 3000;
+    public int ReconnectDelayMs { get; set; } = 1500;
+
+    public decimal Divisor { get; set; } = 1m;
+    public int MinDigits { get; set; } = 3;
+
+    public decimal StableToleranceKg { get; set; } = 20m;
+    public int StableSamples { get; set; } = 6;
+    public int PublishIntervalMs { get; set; } = 150;
+
+    public bool TestMode { get; set; } = true;
+    public int TestTickMs { get; set; } = 150;
+    public int TestMaxKg { get; set; } = 16000;
+    public int TestRampStepKg { get; set; } = 250;
+    public int TestNoiseMaxKg { get; set; } = 25;
+}
+
+// =======================
+// Publisher (Azure SignalR)
+// =======================
+
+public sealed class WeightSignalRPublisher : IHostedService, IAsyncDisposable
+{
+    private readonly ILogger<WeightSignalRPublisher> _log;
+    private readonly SignalROptions _opt;
+    private readonly string _deviceId;
+    private readonly ServiceManager _mgr;
+    private ServiceHubContext? _hub;
+
+    public WeightSignalRPublisher(
+        ILogger<WeightSignalRPublisher> log,
+        IOptions<SignalROptions> opt,
+        IOptions<AppOptions> appOpt,
+        ServiceManager mgr)
+    {
+        _log = log;
+        _opt = opt.Value;
+        _mgr = mgr;
+
+        _deviceId = !string.IsNullOrWhiteSpace(appOpt.Value.ForceDeviceId)
+            ? appOpt.Value.ForceDeviceId!
+            : DeviceIdManager.GetOrCreateDeviceId();
+
+        _log.LogInformation("Device ID: {deviceId}", _deviceId);
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_opt.ConnectionString))
+            throw new InvalidOperationException("SignalR:ConnectionString missing");
+
+        _log.LogInformation("Initializing Azure SignalR for hub '{Hub}'...", _opt.HubName);
+        _hub = await _mgr.CreateHubContextAsync(_opt.HubName, cancellationToken);
+        _log.LogInformation("Azure SignalR hub context ready for '{Hub}'", _opt.HubName);
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        _log.LogInformation("Stopping WeightSignalRPublisher...");
+        try
+        {
+            if (_hub is not null)
+            {
+                await _hub.DisposeAsync();
+                _hub = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Error while stopping WeightSignalRPublisher");
+        }
+    }
+
+    public async Task PublishAsync(decimal weightKg, bool isStable, CancellationToken ct = default)
+    {
+        if (_hub is null) return;
+
+        var payload = new
+        {
+            weight = decimal.Round(weightKg, 1, MidpointRounding.AwayFromZero),
+            isStable,
+            deviceId = _deviceId,
+            tsUtc = DateTime.UtcNow
+        };
+
+        try
+        {
+            await _hub.Clients.User(_deviceId).SendAsync(_opt.MethodName, payload, ct);
+            _log.LogInformation("📡 Sent to user({user}) via SignalR: {payload}",
+                _deviceId, System.Text.Json.JsonSerializer.Serialize(payload));
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "SignalR send failed");
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hub is not null)
+        {
+            await _hub.DisposeAsync();
+            _hub = null;
+        }
+    }
+}
+
+
+// =======================
+// Weight Bridge (live or test)
+// =======================
+
+public interface IWeightBridge
+{
+    event EventHandler<WeightReading>? Reading;
+}
+
+public sealed record WeightReading(decimal WeightKg, bool IsStable, DateTime At);
+
+public sealed class WeightBridgeService : BackgroundService, IWeightBridge
+{
+    public event EventHandler<WeightReading>? Reading;
+
+    private readonly ILogger<WeightBridgeService> _log;
+    private readonly ScaleOptions _opt;
+    private readonly WeightSignalRPublisher _publisher;
+
+    private readonly Regex _valueWithUnit = new(@"(?<!\S)(?<num>[+-]?\d+(?:[.,]\d+)?)[ ]*(?<unit>kg|g|t|lb|oz)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private readonly Regex _anyNumber = new(@"[+-]?\d+(?:[.,]\d+)?", RegexOptions.Compiled);
+
+    public WeightBridgeService(
+        ILogger<WeightBridgeService> log,
+        IOptions<ScaleOptions> opt,
+        WeightSignalRPublisher publisher)
+    {
+        _log = log;
+        _opt = opt.Value;
+        _publisher = publisher;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        decimal lastValue = 0m;
+        int steadyCount = 0;
+        bool lastStable = false;
+        bool haveLast = false;
+
+        async Task PublishAsync(decimal w, bool stable)
+        {
+            Reading?.Invoke(this, new WeightReading(w, stable, DateTime.UtcNow));
+            await _publisher.PublishAsync(w, stable, stoppingToken);
+        }
+
+        if (_opt.TestMode)
+        {
+            _log.LogWarning("WeightBridge TEST MODE: 10x unstable → ONE stable → pause until ENTER.");
+
+            var rnd = new Random();
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var target = rnd.Next(2000, _opt.TestMaxKg + 1);
+                var start = Math.Max(0, target - (_opt.TestRampStepKg * 10));
+                decimal current = start;
+
+                // 10 unstable samples
+                for (int i = 0; i < 10 && !stoppingToken.IsCancellationRequested; i++)
+                {
+                    var noise = rnd.Next(-_opt.TestNoiseMaxKg, _opt.TestNoiseMaxKg + 1);
+                    current = Math.Min(target, current + _opt.TestRampStepKg + noise);
+                    await PublishAsync(current, false);
+                    await Task.Delay(_opt.TestTickMs, stoppingToken);
+                }
+
+                // 1 stable sample
+                current = target;
+                await PublishAsync(current, true);
+                _log.LogInformation("Stable at ~{w} kg — paused. Press ENTER to resume…", current);
+
+                // Wait for ENTER
+                try
+                {
+                    await Task.Run(() => Console.ReadLine(), stoppingToken);
+                }
+                catch (OperationCanceledException) { break; }
+
+                _log.LogInformation("ENTER received. Starting a new cycle…");
+            }
+
+            return;
+        }
+
+        // LIVE MODE (passive TCP scale)
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using var tcp = new TcpClient();
+                var connectTask = tcp.ConnectAsync(_opt.Host, _opt.Port);
+                var winner = await Task.WhenAny(connectTask, Task.Delay(_opt.ReadTimeoutMs, stoppingToken));
+                if (winner != connectTask) throw new TimeoutException("Scale connect timeout");
+                await connectTask;
+
+                using var stream = tcp.GetStream();
+                using var reader = new StreamReader(stream, Encoding.ASCII, false, bufferSize: 8192, leaveOpen: true);
+
+                _log.LogInformation("Scale connected to {host}:{port}", _opt.Host, _opt.Port);
+
+                while (!stoppingToken.IsCancellationRequested)
+                {
+                    string? line;
+                    try
+                    {
+                        using var lineCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                        lineCts.CancelAfter(_opt.ReadTimeoutMs);
+                        line = await reader.ReadLineAsync(lineCts.Token);
+                    }
+                    catch (OperationCanceledException) { continue; }
+
+                    if (line is null) throw new IOException("Scale remote closed.");
+
+                    var clean = Strip(line).Trim();
+                    if (clean.Length == 0) continue;
+
+                    if (TryParseWeight(clean, _opt.MinDigits, _valueWithUnit, _anyNumber, out var raw))
+                    {
+                        var current = raw / _opt.Divisor;
+
+                        if (haveLast && Math.Abs(current - lastValue) <= _opt.StableToleranceKg)
+                            steadyCount++;
+                        else
+                            steadyCount = 0;
+
+                        bool isStable = steadyCount >= _opt.StableSamples;
+
+                        if (!haveLast || isStable != lastStable || Math.Abs(current - lastValue) > 0.01m)
+                        {
+                            await PublishAsync(current, isStable);
+                            lastStable = isStable;
+                            lastValue = current;
+                            haveLast = true;
+                        }
+                    }
+
+                    await Task.Delay(_opt.PublishIntervalMs, stoppingToken);
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Scale loop error; reconnect in {ms}ms", _opt.ReconnectDelayMs);
+                try { await Task.Delay(_opt.ReconnectDelayMs, stoppingToken); } catch { }
+            }
+        }
+
+        static string Strip(string s)
+        {
+            var sb = new StringBuilder(s.Length);
+            foreach (var ch in s) if (!char.IsControl(ch)) sb.Append(ch);
+            return sb.ToString();
+        }
+
+        static bool TryParseWeight(string line, int minDigits, Regex vw, Regex any, out decimal value)
+        {
+            var unitMatches = vw.Matches(line);
+            if (unitMatches.Count > 0)
+            {
+                var m = unitMatches[^1].Groups["num"].Value;
+                if (decimal.TryParse(m, NumberStyles.Float, CultureInfo.InvariantCulture, out value) ||
+                    decimal.TryParse(m, NumberStyles.Float, CultureInfo.GetCultureInfo("fr-FR"), out value))
+                    return true;
+            }
+
+            Match? best = null;
+            foreach (Match m in any.Matches(line))
+            {
+                int digits = 0; foreach (var ch in m.Value) if (char.IsDigit(ch)) digits++;
+                if (digits >= minDigits && (best is null || m.Value.Length > best.Value.Length))
+                    best = m;
+            }
+
+            if (best is not null &&
+                (decimal.TryParse(best.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out value) ||
+                 decimal.TryParse(best.Value, NumberStyles.Float, CultureInfo.GetCultureInfo("fr-FR"), out value)))
+                return true;
+
+            value = default;
+            return false;
+        }
+    }
+}
+
+// =======================
+// Program
+// =======================
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var builder = WebApplication.CreateBuilder(args);
+
+        // Configuration
+        builder.Configuration
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+            .AddEnvironmentVariables();
+
+        // App options
+        builder.Services.Configure<AppOptions>(builder.Configuration.GetSection("App"));
+
+        // SignalR options
+        builder.Services.AddOptions<SignalROptions>()
+            .Configure(o =>
+            {
+                o.ConnectionString = "Endpoint=https://ecare-slv.service.signalr.net;AccessKey=CrQyHLDXs1TdxGNYd13tWmyEAI3nSt5r1l75hQ1DWQNTjc11FIP7JQQJ99BJAC5T7U2XJ3w3AAAAASRS8VuM;Version=1.0;";
+                o.HubName = "entry_weight_hub";
+                o.MethodName = "ReceivefirstWeight";
+            })
+            .ValidateOnStart();
+
+        // Scale options
+        builder.Services.AddOptions<ScaleOptions>()
+            .Configure(o =>
+            {
+                o.TestMode = true;
+                o.TestTickMs = 150;
+                o.TestMaxKg = 16000;
+                o.TestRampStepKg = 250;
+                o.TestNoiseMaxKg = 25;
+                o.Host = "10.116.136.29";
+                o.Port = 4001;
+                o.ReadTimeoutMs = 3000;
+                o.ReconnectDelayMs = 1500;
+                o.Divisor = 1m;
+                o.MinDigits = 3;
+                o.StableToleranceKg = 20m;
+                o.StableSamples = 6;
+                o.PublishIntervalMs = 150;
+            })
+            .ValidateOnStart();
+
+        // ===== ServiceManager (shared) =====
+        builder.Services.AddSingleton(sp =>
+        {
+            var sro = sp.GetRequiredService<IOptions<SignalROptions>>().Value;
+            return new ServiceManagerBuilder()
+                .WithOptions(o => o.ConnectionString = sro.ConnectionString)
+                .BuildServiceManager();
+        });
+
+        // Services
+        builder.Services.AddSingleton<WeightSignalRPublisher>();
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<WeightSignalRPublisher>());
+        builder.Services.AddHostedService<WeightBridgeService>();
+
+        // Logging
+        builder.Logging.ClearProviders();
+        builder.Logging.AddSimpleConsole(o =>
+        {
+            o.SingleLine = true;
+            o.TimestampFormat = "HH:mm:ss ";
+        });
+        builder.Logging.SetMinimumLevel(LogLevel.Information);
+
+        // Configure HTTP port
+        var httpPort = builder.Configuration.GetValue<int>("App:HttpPort", 5001);
+        builder.WebHost.UseUrls($"http://localhost:{httpPort}");
+
+        builder.Services.AddCors();
+
+        var app = builder.Build();
+
+        app.UseCors(policy => policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
+
+        // HTTP Endpoint: GET /device-id (local helper only)
+        app.MapGet("/device-id", () =>
+        {
+            var deviceId = DeviceIdManager.GetOrCreateDeviceId();
+            var filePath = DeviceIdManager.GetDeviceIdFilePath();
+
+            return Results.Json(new
+            {
+                deviceId,
+                filePath,
+                timestamp = DateTime.UtcNow
+            });
+        });
+
+        // Root endpoint
+        app.MapGet("/", () => Results.Json(new
+        {
+            message = "Weight Bridge Service API",
+            endpoints = new[]
+            {
+                "/device-id - Get device identifier"
+                // NOTE: negotiate is handled by another backend
+            }
+        }));
+
+        Console.WriteLine("Weight Bridge → Azure SignalR");
+        Console.WriteLine($"HTTP API listening on http://localhost:{httpPort}");
+        Console.WriteLine($"Device ID file: {DeviceIdManager.GetDeviceIdFilePath()}");
+        Console.WriteLine("Ctrl+C to exit.");
+
+        await app.RunAsync();
+    }
+}
