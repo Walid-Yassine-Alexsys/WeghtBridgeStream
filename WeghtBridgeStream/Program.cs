@@ -71,7 +71,7 @@ public sealed class SignalROptions
 
 public sealed class ScaleOptions
 {
-    public string Host { get; set; } = "10.116.136.29";
+    public string Host { get; set; } = "10.116.136.23";
     public int Port { get; set; } = 4001;
     public int ReadTimeoutMs { get; set; } = 3000;
     public int ReconnectDelayMs { get; set; } = 1500;
@@ -161,7 +161,7 @@ public sealed class WeightSignalRPublisher : IHostedService, IAsyncDisposable
         try
         {
             await _hub.Clients.User(_deviceId).SendAsync(_opt.MethodName, payload, ct);
-            _log.LogInformation("📡 Sent to user({user}) via SignalR: {payload}",
+            _log.LogInformation("Sent to user({user}) via SignalR: {payload}",
                 _deviceId, System.Text.Json.JsonSerializer.Serialize(payload));
         }
         catch (Exception ex)
@@ -217,8 +217,7 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         decimal lastValue = 0m;
-        int steadyCount = 0;
-        bool lastStable = false;
+        int stableCounter = 0;
         bool haveLast = false;
 
         async Task PublishAsync(decimal w, bool stable)
@@ -227,46 +226,29 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
             await _publisher.PublishAsync(w, stable, stoppingToken);
         }
 
+        // ==========================
+        // TEST MODE (unchanged)
+        // ==========================
         if (_opt.TestMode)
         {
-            _log.LogWarning("WeightBridge TEST MODE: 10x unstable → ONE stable → pause until ENTER.");
-
             var rnd = new Random();
+            _log.LogWarning("WeightBridge TEST MODE enabled.");
 
             while (!stoppingToken.IsCancellationRequested)
             {
-                var target = rnd.Next(2000, _opt.TestMaxKg + 1);
-                var start = Math.Max(0, target - (_opt.TestRampStepKg * 10));
-                decimal current = start;
+                var v = rnd.Next(0, _opt.TestMaxKg);
+                var stable = rnd.Next(0, 10) > 7;
 
-                // 10 unstable samples
-                for (int i = 0; i < 10 && !stoppingToken.IsCancellationRequested; i++)
-                {
-                    var noise = rnd.Next(-_opt.TestNoiseMaxKg, _opt.TestNoiseMaxKg + 1);
-                    current = Math.Min(target, current + _opt.TestRampStepKg + noise);
-                    await PublishAsync(current, false);
-                    await Task.Delay(_opt.TestTickMs, stoppingToken);
-                }
-
-                // 1 stable sample
-                current = target;
-                await PublishAsync(current, true);
-                _log.LogInformation("Stable at ~{w} kg — paused. Press ENTER to resume…", current);
-
-                // Wait for ENTER
-                try
-                {
-                    await Task.Run(() => Console.ReadLine(), stoppingToken);
-                }
-                catch (OperationCanceledException) { break; }
-
-                _log.LogInformation("ENTER received. Starting a new cycle…");
+                await PublishAsync(v, stable);
+                await Task.Delay(_opt.TestTickMs, stoppingToken);
             }
 
             return;
         }
 
-        // LIVE MODE (passive TCP scale)
+        // ==========================
+        // REAL LIVE MODE
+        // ==========================
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -275,10 +257,11 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
                 var connectTask = tcp.ConnectAsync(_opt.Host, _opt.Port);
                 var winner = await Task.WhenAny(connectTask, Task.Delay(_opt.ReadTimeoutMs, stoppingToken));
                 if (winner != connectTask) throw new TimeoutException("Scale connect timeout");
+
                 await connectTask;
 
                 using var stream = tcp.GetStream();
-                using var reader = new StreamReader(stream, Encoding.ASCII, false, bufferSize: 8192, leaveOpen: true);
+                using var reader = new StreamReader(stream, Encoding.ASCII, false, 8192, leaveOpen: true);
 
                 _log.LogInformation("Scale connected to {host}:{port}", _opt.Host, _opt.Port);
 
@@ -291,9 +274,13 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
                         lineCts.CancelAfter(_opt.ReadTimeoutMs);
                         line = await reader.ReadLineAsync(lineCts.Token);
                     }
-                    catch (OperationCanceledException) { continue; }
+                    catch (OperationCanceledException)
+                    {
+                        continue;
+                    }
 
-                    if (line is null) throw new IOException("Scale remote closed.");
+                    if (line is null)
+                        throw new IOException("Scale closed connection.");
 
                     var clean = Strip(line).Trim();
                     if (clean.Length == 0) continue;
@@ -302,37 +289,53 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
                     {
                         var current = raw / _opt.Divisor;
 
-                        if (haveLast && Math.Abs(current - lastValue) <= _opt.StableToleranceKg)
-                            steadyCount++;
+                        // ==========================
+                        // NEW STABILITY RULES:
+                        // Stable only if:
+                        //   - Same value appears 3 times consecutively
+                        //   - AND weight >= 2000
+                        // ==========================
+                        if (haveLast && Math.Abs(current - lastValue) < 0.01m)
+                            stableCounter++;
                         else
-                            steadyCount = 0;
+                            stableCounter = 1;
 
-                        bool isStable = steadyCount >= _opt.StableSamples;
+                        bool isStable =
+                            stableCounter >= 7
+                            && current >= 2000m;
 
-                        if (!haveLast || isStable != lastStable || Math.Abs(current - lastValue) > 0.01m)
-                        {
+                        Console.WriteLine("Current Weight:  " + current);
+
+                        // ALWAYS publish real-time
+                        if(current > 2000){
                             await PublishAsync(current, isStable);
-                            lastStable = isStable;
-                            lastValue = current;
-                            haveLast = true;
                         }
+
+                        lastValue = current;
+                        haveLast = true;
                     }
 
-                    await Task.Delay(_opt.PublishIntervalMs, stoppingToken);
+
+                    // Optional small delay (VERY LOW)
+                    //await Task.Delay(50, stoppingToken);
                 }
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "Scale loop error; reconnect in {ms}ms", _opt.ReconnectDelayMs);
-                try { await Task.Delay(_opt.ReconnectDelayMs, stoppingToken); } catch { }
+                _log.LogWarning(ex, "Scale loop error; reconnecting in {ms}ms...", _opt.ReconnectDelayMs);
+                await Task.Delay(_opt.ReconnectDelayMs, stoppingToken);
             }
         }
 
+        // ==========================
+        // Helpers
+        // ==========================
         static string Strip(string s)
         {
             var sb = new StringBuilder(s.Length);
-            foreach (var ch in s) if (!char.IsControl(ch)) sb.Append(ch);
+            foreach (var ch in s)
+                if (!char.IsControl(ch)) sb.Append(ch);
             return sb.ToString();
         }
 
@@ -350,7 +353,8 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
             Match? best = null;
             foreach (Match m in any.Matches(line))
             {
-                int digits = 0; foreach (var ch in m.Value) if (char.IsDigit(ch)) digits++;
+                int digits = 0;
+                foreach (var ch in m.Value) if (char.IsDigit(ch)) digits++;
                 if (digits >= minDigits && (best is null || m.Value.Length > best.Value.Length))
                     best = m;
             }
@@ -364,6 +368,7 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
             return false;
         }
     }
+
 }
 
 // =======================
@@ -398,12 +403,12 @@ public class Program
         builder.Services.AddOptions<ScaleOptions>()
             .Configure(o =>
             {
-                o.TestMode = true;
+                o.TestMode = false;
                 o.TestTickMs = 150;
                 o.TestMaxKg = 16000;
                 o.TestRampStepKg = 250;
                 o.TestNoiseMaxKg = 25;
-                o.Host = "10.116.136.29";
+                o.Host = "10.116.136.23";
                 o.Port = 4001;
                 o.ReadTimeoutMs = 3000;
                 o.ReconnectDelayMs = 1500;
@@ -466,7 +471,7 @@ public class Program
         app.MapGet("/", () => Results.Json(new
         {
             message = "Weight Bridge Service API",
-            endpoints = new[]
+            endpoints = new[]   
             {
                 "/device-id - Get device identifier"
                 // NOTE: negotiate is handled by another backend
