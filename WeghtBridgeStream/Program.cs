@@ -71,7 +71,7 @@ public sealed class SignalROptions
 
 public sealed class ScaleOptions
 {
-    public string Host { get; set; } = "10.116.136.23";
+    public string Host { get; set; } = "10.116.136.29";
     public int Port { get; set; } = 4001;
     public int ReadTimeoutMs { get; set; } = 3000;
     public int ReconnectDelayMs { get; set; } = 1500;
@@ -227,7 +227,7 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
         }
 
         // ==========================
-        // TEST MODE (unchanged)
+        // TEST MODE (modified)
         // ==========================
         if (_opt.TestMode)
         {
@@ -236,15 +236,36 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
 
             while (!stoppingToken.IsCancellationRequested)
             {
-                var v = rnd.Next(0, _opt.TestMaxKg);
-                var stable = rnd.Next(0, 10) > 7;
+                // 10 UNSTABLE VALUES
+                for (int i = 0; i < 10; i++)
+                {
+                    int weight = rnd.Next(0, _opt.TestMaxKg);
+                    bool stable = false;
 
-                await PublishAsync(v, stable);
-                await Task.Delay(_opt.TestTickMs, stoppingToken);
+                    await PublishAsync(weight, stable);
+                    await Task.Delay(_opt.TestTickMs, stoppingToken);
+                }
+
+                // 11th VALUE — STABLE
+                {
+                    int weight = rnd.Next(0, _opt.TestMaxKg);
+                    bool stable = true;
+
+                    await PublishAsync(weight, stable);
+                    await Task.Delay(_opt.TestTickMs, stoppingToken);
+                }
+
+                // STOP AND WAIT FOR USER INPUT
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("▶ TEST MODE paused. Press ENTER to send a new batch...");
+                Console.ResetColor();
+
+                Console.ReadLine(); // Wait here
             }
 
             return;
         }
+
 
         // ==========================
         // REAL LIVE MODE
@@ -393,7 +414,7 @@ public class Program
         builder.Services.AddOptions<SignalROptions>()
             .Configure(o =>
             {
-                o.ConnectionString = "Endpoint=https://ecare-slv.service.signalr.net;AccessKey=CrQyHLDXs1TdxGNYd13tWmyEAI3nSt5r1l75hQ1DWQNTjc11FIP7JQQJ99BJAC5T7U2XJ3w3AAAAASRS8VuM;Version=1.0;";
+                o.ConnectionString = "Endpoint=https://mycimarfluxsignalr.service.signalr.net;AccessKey=2aFWipEfcQGVj6VDehqMuGYwbqKG9tDrCSzWh7FgNUGj6UlZKTNJJQQJ99BKACi5YpzXJ3w3AAAAASRS8VVJ;Version=1.0;";
                 o.HubName = "entry_weight_hub";
                 o.MethodName = "ReceivefirstWeight";
             })
@@ -403,12 +424,12 @@ public class Program
         builder.Services.AddOptions<ScaleOptions>()
             .Configure(o =>
             {
-                o.TestMode = false;
+                o.TestMode = true;
                 o.TestTickMs = 150;
                 o.TestMaxKg = 16000;
                 o.TestRampStepKg = 250;
                 o.TestNoiseMaxKg = 25;
-                o.Host = "10.116.136.23";
+                o.Host = "10.116.136.29";
                 o.Port = 4001;
                 o.ReadTimeoutMs = 3000;
                 o.ReconnectDelayMs = 1500;
