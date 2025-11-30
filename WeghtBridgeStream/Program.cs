@@ -71,7 +71,7 @@ public sealed class SignalROptions
 
 public sealed class ScaleOptions
 {
-    public string Host { get; set; } = "10.116.136.29";
+    public string Host { get; set; } = "10.8.197.21";
     public int Port { get; set; } = 4001;
     public int ReadTimeoutMs { get; set; } = 3000;
     public int ReconnectDelayMs { get; set; } = 1500;
@@ -322,7 +322,7 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
                             stableCounter = 1;
 
                         bool isStable =
-                            stableCounter >= 7
+                            stableCounter >= 15
                             && current >= 2000m;
 
                         Console.WriteLine("Current Weight:  " + current);
@@ -424,12 +424,12 @@ public class Program
         builder.Services.AddOptions<ScaleOptions>()
             .Configure(o =>
             {
-                o.TestMode = true;
+                o.TestMode = false;
                 o.TestTickMs = 150;
                 o.TestMaxKg = 16000;
                 o.TestRampStepKg = 250;
                 o.TestNoiseMaxKg = 25;
-                o.Host = "10.116.136.29";
+                o.Host = "10.8.197.21";
                 o.Port = 4001;
                 o.ReadTimeoutMs = 3000;
                 o.ReconnectDelayMs = 1500;
