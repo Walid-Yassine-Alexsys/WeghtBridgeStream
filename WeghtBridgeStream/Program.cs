@@ -65,8 +65,8 @@ public sealed class AppOptions
 public sealed class SignalROptions
 {
     public string ConnectionString { get; set; } = default!;
-    public string HubName { get; set; } = "entry_weight_hub";
-    public string MethodName { get; set; } = "ReceivefirstWeight";
+    public string HubName { get; set; } = "pabexit_weight_hub";
+    public string MethodName { get; set; } = "ReceiveExitWeight";
 }
 
 public sealed class ScaleOptions
@@ -415,8 +415,8 @@ public class Program
             .Configure(o =>
             {
                 o.ConnectionString = "Endpoint=https://mycimarfluxsignalr.service.signalr.net;AccessKey=2aFWipEfcQGVj6VDehqMuGYwbqKG9tDrCSzWh7FgNUGj6UlZKTNJJQQJ99BKACi5YpzXJ3w3AAAAASRS8VVJ;Version=1.0;";
-                o.HubName = "entry_weight_hub";
-                o.MethodName = "ReceivefirstWeight";
+                o.HubName = "pabexit_weight_hub";
+                o.MethodName = "ReceiveExitWeight";
             })
             .ValidateOnStart();
 
@@ -429,7 +429,7 @@ public class Program
                 o.TestMaxKg = 16000;
                 o.TestRampStepKg = 250;
                 o.TestNoiseMaxKg = 25;
-                o.Host = "10.8.197.21";
+                o.Host = "10.8.197.26";
                 o.Port = 4001;
                 o.ReadTimeoutMs = 3000;
                 o.ReconnectDelayMs = 1500;
