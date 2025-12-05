@@ -73,19 +73,19 @@ public sealed class SignalROptions
 
 public sealed class ScaleOptions
 {
-    public string Host { get; set; } = "10.8.197.24";
+    public string Host { get; set; } = "10.8.197.26";
     public int Port { get; set; } = 4001;
     public int ReadTimeoutMs { get; set; } = 3000;
     public int ReconnectDelayMs { get; set; } = 1500;
 
     public decimal Divisor { get; set; } = 1m;
-    public int MinDigits { get; set; } = 3;
+    public int MinDigits { get; set; } = 0;
 
     public decimal StableToleranceKg { get; set; } = 20m;
     public int StableSamples { get; set; } = 6;
     public int PublishIntervalMs { get; set; } = 150;
 
-    public bool TestMode { get; set; } = true;
+    public bool TestMode { get; set; } = false;
     public int TestTickMs { get; set; } = 150;
     public int TestMaxKg { get; set; } = 16000;
     public int TestRampStepKg { get; set; } = 250;
