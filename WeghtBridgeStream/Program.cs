@@ -8,7 +8,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System;
 using System.Globalization;
+using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -83,7 +85,7 @@ public sealed class ScaleOptions
     public int StableSamples { get; set; } = 6;
     public int PublishIntervalMs { get; set; } = 150;
 
-    public bool TestMode { get; set; } = true;
+    public bool TestMode { get; set; } = false;
     public int TestTickMs { get; set; } = 150;
     public int TestMaxKg { get; set; } = 16000;
     public int TestRampStepKg { get; set; } = 250;
@@ -180,9 +182,74 @@ public sealed class WeightSignalRPublisher : IHostedService, IAsyncDisposable
     }
 }
 
+// =======================
+// Weight Parser (shared logic)
+// =======================
+
+internal static class WeightParser
+{
+    private static readonly Regex ValueWithUnit = new(
+        @"(?<!\S)(?<num>[+-]?\d+(?:[.,]\d+)?)[ ]*(?<unit>kg|g|t|lb|oz)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex AnyNumber = new(
+        @"[+-]?\d+(?:[.,]\d+)?",
+        RegexOptions.Compiled);
+
+    public static string StripControlChars(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (var ch in s)
+            if (!char.IsControl(ch)) sb.Append(ch);
+        return sb.ToString();
+    }
+
+    public static bool TryParseWeight(string line, int minDigits, out decimal value)
+    {
+        // 1) Try "value + unit" (e.g. "  12345 kg")
+        var unitMatches = ValueWithUnit.Matches(line);
+        if (unitMatches.Count > 0)
+        {
+            var m = unitMatches[^1];
+            var raw = m.Groups["num"].Value;
+            if (TryParseDecimalFlexible(raw, out value))
+                return true;
+        }
+
+        // 2) Fallback: longest numeric token with at least minDigits
+        Match? best = null;
+        foreach (Match m in AnyNumber.Matches(line))
+        {
+            int digits = CountDigits(m.Value);
+            if (digits >= minDigits && (best is null || m.Value.Length > best.Value.Length))
+                best = m;
+        }
+
+        if (best is not null && TryParseDecimalFlexible(best.Value, out value))
+            return true;
+
+        value = default;
+        return false;
+    }
+
+    private static int CountDigits(string s)
+    {
+        int c = 0;
+        foreach (var ch in s)
+            if (char.IsDigit(ch)) c++;
+        return c;
+    }
+
+    private static bool TryParseDecimalFlexible(string s, out decimal v)
+    {
+        if (decimal.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return true;
+        if (decimal.TryParse(s, NumberStyles.Float, CultureInfo.GetCultureInfo("fr-FR"), out v)) return true;
+        return false;
+    }
+}
 
 // =======================
-// Weight Bridge (live or test)
+// Weight Bridge (live or test) — BYTE READER STYLE
 // =======================
 
 public interface IWeightBridge
@@ -199,10 +266,6 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
     private readonly ILogger<WeightBridgeService> _log;
     private readonly ScaleOptions _opt;
     private readonly WeightSignalRPublisher _publisher;
-
-    private readonly Regex _valueWithUnit = new(@"(?<!\S)(?<num>[+-]?\d+(?:[.,]\d+)?)[ ]*(?<unit>kg|g|t|lb|oz)\b",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private readonly Regex _anyNumber = new(@"[+-]?\d+(?:[.,]\d+)?", RegexOptions.Compiled);
 
     public WeightBridgeService(
         ILogger<WeightBridgeService> log,
@@ -227,7 +290,7 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
         }
 
         // ==========================
-        // TEST MODE (modified)
+        // TEST MODE
         // ==========================
         if (_opt.TestMode)
         {
@@ -237,7 +300,7 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
             while (!stoppingToken.IsCancellationRequested)
             {
                 // 10 UNSTABLE VALUES
-                for (int i = 0; i < 10; i++)
+                for (int i = 0; i < 10 && !stoppingToken.IsCancellationRequested; i++)
                 {
                     int weight = rnd.Next(0, _opt.TestMaxKg);
                     bool stable = false;
@@ -245,6 +308,8 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
                     await PublishAsync(weight, stable);
                     await Task.Delay(_opt.TestTickMs, stoppingToken);
                 }
+
+                if (stoppingToken.IsCancellationRequested) break;
 
                 // 11th VALUE — STABLE
                 {
@@ -266,130 +331,104 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
             return;
         }
 
+        // ==========================
+        // REAL LIVE MODE — BYTE READER
+        // ==========================
+        byte[] buffer = new byte[2048];
 
-        // ==========================
-        // REAL LIVE MODE
-        // ==========================
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
                 using var tcp = new TcpClient();
-                var connectTask = tcp.ConnectAsync(_opt.Host, _opt.Port);
-                var winner = await Task.WhenAny(connectTask, Task.Delay(_opt.ReadTimeoutMs, stoppingToken));
-                if (winner != connectTask) throw new TimeoutException("Scale connect timeout");
+                _log.LogInformation("Connecting to scale {Host}:{Port} ...", _opt.Host, _opt.Port);
 
-                await connectTask;
+                await tcp.ConnectAsync(_opt.Host, _opt.Port, stoppingToken);
 
-                using var stream = tcp.GetStream();
-                using var reader = new StreamReader(stream, Encoding.ASCII, false, 8192, leaveOpen: true);
+                if (!tcp.Connected)
+                {
+                    _log.LogWarning("Scale connection failed.");
+                    await Task.Delay(_opt.ReconnectDelayMs, stoppingToken);
+                    continue;
+                }
 
-                _log.LogInformation("Scale connected to {host}:{port}", _opt.Host, _opt.Port);
+                tcp.ReceiveTimeout = _opt.ReadTimeoutMs;
+                _log.LogInformation("Scale connected to {Host}:{Port}", _opt.Host, _opt.Port);
+
+                using NetworkStream stream = tcp.GetStream();
+
+                // Flush any garbage already buffered
+                while (stream.DataAvailable)
+                {
+                    await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), stoppingToken);
+                }
 
                 while (!stoppingToken.IsCancellationRequested)
                 {
-                    string? line;
-                    try
+                    if (!stream.DataAvailable)
                     {
-                        using var lineCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-                        lineCts.CancelAfter(_opt.ReadTimeoutMs);
-                        line = await reader.ReadLineAsync(lineCts.Token);
-                    }
-                    catch (OperationCanceledException)
-                    {
+                        await Task.Delay(5, stoppingToken);
                         continue;
                     }
 
-                    if (line is null)
+                    int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), stoppingToken);
+                    if (bytesRead <= 0)
                         throw new IOException("Scale closed connection.");
 
-                    var clean = Strip(line).Trim();
-                    if (clean.Length == 0) continue;
+                    string chunk = Encoding.ASCII.GetString(buffer, 0, bytesRead);
 
-                    if (TryParseWeight(clean, _opt.MinDigits, _valueWithUnit, _anyNumber, out var raw))
+                    // Take only the *last* frame in this chunk
+                    string[] frames = chunk.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                    if (frames.Length == 0) continue;
+
+                    string lastFrame = WeightParser.StripControlChars(frames[^1]).Trim();
+                    if (lastFrame.Length == 0) continue;
+
+                    if (!WeightParser.TryParseWeight(lastFrame, _opt.MinDigits, out var raw))
+                        continue;
+
+                    var current = raw / _opt.Divisor;
+
+                    // STABILITY RULES:
+                    //   - same value repeated many times
+                    //   - AND >= 2000 kg
+                    if (haveLast && Math.Abs(current - lastValue) < 0.01m)
+                        stableCounter++;
+                    else
+                        stableCounter = 1;
+
+                    bool isStable = stableCounter >= 15 && current >= 2000m;
+
+                    Console.WriteLine("Current Weight: " + current);
+
+                    // Always publish above a threshold
+                    if (current > 2000m)
                     {
-                        var current = raw / _opt.Divisor;
-
-                        // ==========================
-                        // NEW STABILITY RULES:
-                        // Stable only if:
-                        //   - Same value appears 3 times consecutively
-                        //   - AND weight >= 2000
-                        // ==========================
-                        if (haveLast && Math.Abs(current - lastValue) < 0.01m)
-                            stableCounter++;
-                        else
-                            stableCounter = 1;
-
-                        bool isStable =
-                            stableCounter >= 15
-                            && current >= 2000m;
-
-                        Console.WriteLine("Current Weight:  " + current);
-
-                        // ALWAYS publish real-time
-                        if(current > 2000){
-                            await PublishAsync(current, isStable);
-                        }
-
-                        lastValue = current;
-                        haveLast = true;
+                        await PublishAsync(current, isStable);
                     }
 
-
-                    // Optional small delay (VERY LOW)
-                    //await Task.Delay(50, stoppingToken);
+                    lastValue = current;
+                    haveLast = true;
                 }
             }
-            catch (OperationCanceledException) { break; }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "Scale loop error; reconnecting in {ms}ms...", _opt.ReconnectDelayMs);
-                await Task.Delay(_opt.ReconnectDelayMs, stoppingToken);
+                try
+                {
+                    await Task.Delay(_opt.ReconnectDelayMs, stoppingToken);
+                }
+                catch
+                {
+                    // ignore
+                }
             }
-        }
-
-        // ==========================
-        // Helpers
-        // ==========================
-        static string Strip(string s)
-        {
-            var sb = new StringBuilder(s.Length);
-            foreach (var ch in s)
-                if (!char.IsControl(ch)) sb.Append(ch);
-            return sb.ToString();
-        }
-
-        static bool TryParseWeight(string line, int minDigits, Regex vw, Regex any, out decimal value)
-        {
-            var unitMatches = vw.Matches(line);
-            if (unitMatches.Count > 0)
-            {
-                var m = unitMatches[^1].Groups["num"].Value;
-                if (decimal.TryParse(m, NumberStyles.Float, CultureInfo.InvariantCulture, out value) ||
-                    decimal.TryParse(m, NumberStyles.Float, CultureInfo.GetCultureInfo("fr-FR"), out value))
-                    return true;
-            }
-
-            Match? best = null;
-            foreach (Match m in any.Matches(line))
-            {
-                int digits = 0;
-                foreach (var ch in m.Value) if (char.IsDigit(ch)) digits++;
-                if (digits >= minDigits && (best is null || m.Value.Length > best.Value.Length))
-                    best = m;
-            }
-
-            if (best is not null &&
-                (decimal.TryParse(best.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out value) ||
-                 decimal.TryParse(best.Value, NumberStyles.Float, CultureInfo.GetCultureInfo("fr-FR"), out value)))
-                return true;
-
-            value = default;
-            return false;
         }
     }
-
 }
 
 // =======================
@@ -410,35 +449,14 @@ public class Program
         // App options
         builder.Services.Configure<AppOptions>(builder.Configuration.GetSection("App"));
 
-        // SignalR options
+        // SignalR options (bind from configuration)
         builder.Services.AddOptions<SignalROptions>()
-            .Configure(o =>
-            {
-                o.ConnectionString = "Endpoint=https://mycimarfluxsignalr.service.signalr.net;AccessKey=2aFWipEfcQGVj6VDehqMuGYwbqKG9tDrCSzWh7FgNUGj6UlZKTNJJQQJ99BKACi5YpzXJ3w3AAAAASRS8VVJ;Version=1.0;";
-                o.HubName = "entry_weight_hub";
-                o.MethodName = "ReceivefirstWeight";
-            })
+            .Bind(builder.Configuration.GetSection("SignalR"))
             .ValidateOnStart();
 
-        // Scale options
+        // Scale options (bind from configuration)
         builder.Services.AddOptions<ScaleOptions>()
-            .Configure(o =>
-            {
-                o.TestMode = false;
-                o.TestTickMs = 150;
-                o.TestMaxKg = 16000;
-                o.TestRampStepKg = 250;
-                o.TestNoiseMaxKg = 25;
-                o.Host = "10.8.197.21";
-                o.Port = 4001;
-                o.ReadTimeoutMs = 3000;
-                o.ReconnectDelayMs = 1500;
-                o.Divisor = 1m;
-                o.MinDigits = 3;
-                o.StableToleranceKg = 20m;
-                o.StableSamples = 6;
-                o.PublishIntervalMs = 150;
-            })
+            .Bind(builder.Configuration.GetSection("Scale"))
             .ValidateOnStart();
 
         // ===== ServiceManager (shared) =====
@@ -491,15 +509,15 @@ public class Program
         // Root endpoint
         app.MapGet("/", () => Results.Json(new
         {
-            message = "Weight Bridge Service API",
-            endpoints = new[]   
+            message = "Entry Weight Bridge Service API",
+            endpoints = new[]
             {
                 "/device-id - Get device identifier"
                 // NOTE: negotiate is handled by another backend
             }
         }));
 
-        Console.WriteLine("Weight Bridge → Azure SignalR");
+        Console.WriteLine("ENTRY Weight Bridge → Azure SignalR");
         Console.WriteLine($"HTTP API listening on http://localhost:{httpPort}");
         Console.WriteLine($"Device ID file: {DeviceIdManager.GetDeviceIdFilePath()}");
         Console.WriteLine("Ctrl+C to exit.");
