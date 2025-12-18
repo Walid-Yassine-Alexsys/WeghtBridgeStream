@@ -363,53 +363,70 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
                     await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), stoppingToken);
                 }
 
+                var pending = new List<byte>(8192);
+
                 while (!stoppingToken.IsCancellationRequested)
                 {
-                    if (!stream.DataAvailable)
-                    {
-                        await Task.Delay(5, stoppingToken);
-                        continue;
-                    }
-
                     int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), stoppingToken);
-                    if (bytesRead <= 0)
-                        throw new IOException("Scale closed connection.");
+                    if (bytesRead <= 0) throw new IOException("Scale closed connection.");
 
-                    string chunk = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                    // append new bytes
+                    for (int i = 0; i < bytesRead; i++) pending.Add(buffer[i]);
 
-                    // Take only the *last* frame in this chunk
-                    string[] frames = chunk.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-                    if (frames.Length == 0) continue;
-
-                    string lastFrame = WeightParser.StripControlChars(frames[^1]).Trim();
-                    if (lastFrame.Length == 0) continue;
-
-                    if (!WeightParser.TryParseWeight(lastFrame, _opt.MinDigits, out var raw))
-                        continue;
-
-                    var current = raw / _opt.Divisor;
-
-                    // STABILITY RULES:
-                    //   - same value repeated many times
-                    //   - AND >= 2000 kg
-                    if (haveLast && Math.Abs(current - lastValue) < 0.01m)
-                        stableCounter++;
-                    else
-                        stableCounter = 1;
-
-                    bool isStable = stableCounter >= 15 && current >= 2000m;
-
-                    Console.WriteLine("Current Weight: " + current);
-
-                    // Always publish above a threshold
-                    if (current > 2000m)
+                    while (true)
                     {
-                        await PublishAsync(current, isStable);
+                        int stx = pending.IndexOf(0x02);
+                        if (stx < 0)
+                        {
+                            pending.Clear();
+                            break;
+                        }
+
+                        if (stx > 0) pending.RemoveRange(0, stx);
+
+                        int cr = pending.IndexOf(0x0D, startIndex: 1);
+                        if (cr < 0)
+                        {
+                            break;
+                        }
+
+                        var payloadBytes = pending.GetRange(1, cr - 1).ToArray();
+
+                        pending.RemoveRange(0, cr + 1);
+
+                        if (pending.Count > 0 && pending[0] != 0x02)
+                        {
+                            pending.RemoveAt(0);
+                        }
+
+                        // decode payload and parse
+                        string line = Encoding.ASCII.GetString(payloadBytes).Trim();
+                        if (line.Length == 0) continue;
+
+                        if (!WeightParser.TryParseWeight(line, _opt.MinDigits, out var raw))
+                            continue;
+
+                        var current = raw / _opt.Divisor;
+
+                        if (haveLast && Math.Abs(current - lastValue) < 0.01m)
+                            stableCounter++;
+                        else
+                            stableCounter = 1;
+
+                        bool isStable = stableCounter >= 15 && current >= 2000m;
+
+                        Console.WriteLine("Current Weight: " + current);
+
+                        if (current > 2000m)
+                            await PublishAsync(current, isStable);
+
+                        lastValue = current;
+                        haveLast = true;
                     }
 
-                    lastValue = current;
-                    haveLast = true;
+                    if (pending.Count > 100_000) pending.Clear();
                 }
+
             }
             catch (OperationCanceledException)
             {
@@ -429,8 +446,17 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
             }
         }
     }
-}
 
+}
+static class ByteListExtensions
+{
+    public static int IndexOf(this List<byte> data, byte value, int startIndex = 0)
+    {
+        for (int i = startIndex; i < data.Count; i++)
+            if (data[i] == value) return i;
+        return -1;
+    }
+}
 // =======================
 // Program
 // =======================
