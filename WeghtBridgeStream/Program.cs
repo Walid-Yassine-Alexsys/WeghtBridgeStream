@@ -413,12 +413,13 @@ public sealed class WeightBridgeService : BackgroundService, IWeightBridge
                         else
                             stableCounter = 1;
 
+                        // Stability is only ever reached at truck weights (>= 2000 kg);
+                        // lighter readings are published but can never be stable.
                         bool isStable = stableCounter >= 15 && current >= 2000m;
 
                         Console.WriteLine("Current Weight: " + current);
 
-                        if (current > 2000m)
-                            await PublishAsync(current, isStable);
+                        await PublishAsync(current, isStable);
 
                         lastValue = current;
                         haveLast = true;
